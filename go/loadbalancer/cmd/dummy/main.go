@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":9001", "address to listen on")
+	addr := flag.String("addr", "9001", "address to listen on")
 	name := flag.String("name", "backend-1", "label for this backend")
 	flag.Parse()
 
