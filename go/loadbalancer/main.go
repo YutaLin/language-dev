@@ -5,12 +5,29 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Backend struct {
 	URL   *url.URL
 	Proxy *httputil.ReverseProxy
+
+	mu    sync.RWMutex
+	alive bool
+}
+
+func (b *Backend) SetAlive(alive bool) {
+	b.mu.Lock()
+	b.alive = alive
+	b.mu.Unlock()
+}
+
+func (b *Backend) IsAlive() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.alive
 }
 
 type LoadBalancer struct {
@@ -28,6 +45,7 @@ func NewLoadBalancer(targets []string) (*LoadBalancer, error) {
 		backends = append(backends, &Backend{
 			URL:   u,
 			Proxy: httputil.NewSingleHostReverseProxy(u),
+			alive: true,
 		})
 	}
 
@@ -35,15 +53,56 @@ func NewLoadBalancer(targets []string) (*LoadBalancer, error) {
 }
 
 func (lb *LoadBalancer) next() *Backend {
-	n := lb.current.Add(1)
-	idx := (n - 1) % uint64(len(lb.backends))
-	return lb.backends[idx]
+	n := len(lb.backends)
+	start := lb.current.Add(1) - 1
+	for i := 0; i < n; i++ {
+		idx := (start + uint64(i)) % uint64(n)
+		b := lb.backends[idx]
+		if b.IsAlive() {
+			return b
+		}
+	}
+	return nil
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b := lb.next()
+	if b == nil {
+		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
+		return
+	}
 	log.Printf("routing %s -> %s", r.URL.Path, b.URL)
 	b.Proxy.ServeHTTP(w, r)
+}
+
+func (lb *LoadBalancer) checkHealth() {
+	for _, b := range lb.backends {
+		alive := isBackendAlive(b.URL)
+		was := b.IsAlive()
+		b.SetAlive(alive)
+		if was != alive {
+			log.Printf("backend %s changed: alive=%v", b.URL, alive)
+		}
+	}
+}
+
+func isBackendAlive(u *url.URL) bool {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(u.String() + "/healthz")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// HealthLoop runs forever, checking every interval. Run it in its own goroutine.
+func (lb *LoadBalancer) HealthLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		lb.checkHealth()
+	}
 }
 
 func main() {
@@ -57,6 +116,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	go lb.HealthLoop(2 * time.Second)
 
 	log.Println("load balancer listening on :8080")
 	if err := http.ListenAndServe(":8080", lb); err != nil {
