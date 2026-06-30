@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -9,6 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+type ctxKey int
+
+const attemptsKey ctxKey = iota
+const maxAttempts = 3
 
 type Backend struct {
 	URL   *url.URL
@@ -22,6 +28,16 @@ func (b *Backend) SetAlive(alive bool) {
 	b.mu.Lock()
 	b.alive = alive
 	b.mu.Unlock()
+}
+
+func (b *Backend) SetAliveIfChanged(alive bool) (changed bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.alive != alive {
+		b.alive = alive
+		return true
+	}
+	return false
 }
 
 func (b *Backend) IsAlive() bool {
@@ -49,7 +65,44 @@ func NewLoadBalancer(targets []string) (*LoadBalancer, error) {
 		})
 	}
 
-	return &LoadBalancer{backends: backends}, nil
+	lb := &LoadBalancer{backends: backends}
+
+	for _, b := range backends {
+		b := b
+		b.Proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			if b.SetAliveIfChanged(false) {
+				log.Printf("backend %s marked dead (passive): %v", b.URL, err)
+			}
+			lb.retry(w, r)
+		}
+	}
+
+	return lb, nil
+}
+
+func (lb *LoadBalancer) retry(w http.ResponseWriter, r *http.Request) {
+	attempts := attemptsFromContext(r)
+	if attempts >= maxAttempts {
+		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
+		return
+	}
+
+	b := lb.next()
+	if b == nil {
+		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx := context.WithValue(r.Context(), attemptsKey, attempts+1)
+	log.Printf("retry #%d routing %s -> %s", attempts+1, r.URL.Path, b.URL)
+	b.Proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func attemptsFromContext(r *http.Request) int {
+	if v, ok := r.Context().Value(attemptsKey).(int); ok {
+		return v
+	}
+	return 0
 }
 
 func (lb *LoadBalancer) next() *Backend {
@@ -66,6 +119,10 @@ func (lb *LoadBalancer) next() *Backend {
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
+
 	b := lb.next()
 	if b == nil {
 		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
@@ -78,10 +135,8 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (lb *LoadBalancer) checkHealth() {
 	for _, b := range lb.backends {
 		alive := isBackendAlive(b.URL)
-		was := b.IsAlive()
-		b.SetAlive(alive)
-		if was != alive {
-			log.Printf("backend %s changed: alive=%v", b.URL, alive)
+		if b.SetAliveIfChanged(alive) {
+			log.Printf("backend %s changed (active): alive=%v", b.URL, alive)
 		}
 	}
 }
