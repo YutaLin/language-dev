@@ -7,7 +7,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -17,11 +16,14 @@ const attemptsKey ctxKey = iota
 const maxAttempts = 3
 
 type Backend struct {
-	URL   *url.URL
-	Proxy *httputil.ReverseProxy
+	URL    *url.URL
+	Proxy  *httputil.ReverseProxy
+	Weight int
 
 	mu    sync.RWMutex
 	alive bool
+
+	currentWeight int
 }
 
 func (b *Backend) SetAlive(alive bool) {
@@ -48,20 +50,21 @@ func (b *Backend) IsAlive() bool {
 
 type LoadBalancer struct {
 	backends []*Backend
-	current  atomic.Uint64
+	mu       sync.Mutex
 }
 
-func NewLoadBalancer(targets []string) (*LoadBalancer, error) {
+func NewLoadBalancer(targets []BackendConfig) (*LoadBalancer, error) {
 	var backends []*Backend
 	for _, t := range targets {
-		u, err := url.Parse(t)
+		u, err := url.Parse(t.URL)
 		if err != nil {
 			return nil, err
 		}
 		backends = append(backends, &Backend{
-			URL:   u,
-			Proxy: httputil.NewSingleHostReverseProxy(u),
-			alive: true,
+			URL:    u,
+			Proxy:  httputil.NewSingleHostReverseProxy(u),
+			alive:  true,
+			Weight: t.Weight,
 		})
 	}
 
@@ -106,16 +109,31 @@ func attemptsFromContext(r *http.Request) int {
 }
 
 func (lb *LoadBalancer) next() *Backend {
-	n := len(lb.backends)
-	start := lb.current.Add(1) - 1
-	for i := 0; i < n; i++ {
-		idx := (start + uint64(i)) % uint64(n)
-		b := lb.backends[idx]
-		if b.IsAlive() {
-			return b
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	var best *Backend
+	total := 0
+	for _, b := range lb.backends {
+		if !b.IsAlive() {
+			continue
+		}
+		total += b.Weight
+		b.currentWeight += b.Weight
+		if best == nil || b.currentWeight > best.currentWeight {
+			best = b
 		}
 	}
-	return nil
+	if best == nil {
+		return nil // no live backends
+	}
+	best.currentWeight -= total
+	return best
+}
+
+type BackendConfig struct {
+	URL    string
+	Weight int
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -161,10 +179,10 @@ func (lb *LoadBalancer) HealthLoop(interval time.Duration) {
 }
 
 func main() {
-	targets := []string{
-		"http://localhost:9001",
-		"http://localhost:9002",
-		"http://localhost:9003",
+	targets := []BackendConfig{
+		{URL: "http://localhost:9001", Weight: 5},
+		{URL: "http://localhost:9002", Weight: 1},
+		{URL: "http://localhost:9003", Weight: 1},
 	}
 
 	lb, err := NewLoadBalancer(targets)
